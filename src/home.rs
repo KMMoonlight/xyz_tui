@@ -9,7 +9,7 @@ use ratatui::{
 
 use crate::recommendations::Recommendations;
 use crate::settings::Settings;
-use crate::subscriptions::{self, Source, Subscriptions};
+use crate::subscriptions::{self, Detail, Source, Subscriptions};
 use crate::{auth::Error, content::PlaylistEntry, help::Context, playlist::Playlist};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -66,10 +66,26 @@ pub struct Home {
     subscriptions: Box<Subscriptions>,
     recommendations: Box<Recommendations>,
     settings: Box<Settings>,
+    player_detail: Option<Box<Detail>>,
 }
 
 impl Home {
+    pub fn open_player_detail(
+        &mut self,
+        episode: crate::content::Episode,
+    ) -> Vec<subscriptions::Request> {
+        let eid = episode.eid.clone();
+        self.player_detail = Some(Box::new(Detail::new(episode)));
+        vec![
+            subscriptions::Request::Detail(eid.clone()),
+            subscriptions::Request::Comments(eid, None),
+        ]
+    }
+
     pub fn help_context(&self) -> Context {
+        if let Some(detail) = &self.player_detail {
+            return detail.help_context();
+        }
         match self.screen {
             Screen::Menu => Context::Menu,
             Screen::Detail(Menu::Playlist) => Context::Playlist {
@@ -82,6 +98,14 @@ impl Home {
     }
 
     pub fn key(&mut self, key: KeyCode) -> Action {
+        if let Some(detail) = &mut self.player_detail {
+            if matches!(key, KeyCode::Esc | KeyCode::Backspace) {
+                self.player_detail = None;
+                return Action::None;
+            }
+            let action = detail.key(key);
+            return self.browse_action(Source::Player, action);
+        }
         if let Screen::Detail(menu) = self.screen {
             if matches!(
                 menu,
@@ -95,18 +119,7 @@ impl Home {
                 } else {
                     (Source::Subscriptions, self.subscriptions.key(key))
                 };
-                return match action {
-                    subscriptions::Action::None => Action::None,
-                    subscriptions::Action::Back => {
-                        self.screen = Screen::Menu;
-                        Action::None
-                    }
-                    subscriptions::Action::Login => Action::Login,
-                    subscriptions::Action::Logout => Action::Logout,
-                    subscriptions::Action::Play(eid) => Action::PlayAndAdd(eid),
-                    subscriptions::Action::Add(eid) => Action::Add(eid),
-                    subscriptions::Action::Load(requests) => Action::Browse(source, requests),
-                };
+                return self.browse_action(source, action);
             }
             return match key {
                 KeyCode::Esc | KeyCode::Backspace => {
@@ -178,6 +191,21 @@ impl Home {
         self.settings.logout_failed();
     }
 
+    fn browse_action(&mut self, source: Source, action: subscriptions::Action) -> Action {
+        match action {
+            subscriptions::Action::None => Action::None,
+            subscriptions::Action::Back => {
+                self.screen = Screen::Menu;
+                Action::None
+            }
+            subscriptions::Action::Login => Action::Login,
+            subscriptions::Action::Logout => Action::Logout,
+            subscriptions::Action::Play(eid) => Action::PlayAndAdd(eid),
+            subscriptions::Action::Add(eid) => Action::Add(eid),
+            subscriptions::Action::Load(requests) => Action::Browse(source, requests),
+        }
+    }
+
     pub fn loading_playlist(&mut self) {
         self.playlist.begin();
     }
@@ -191,6 +219,11 @@ impl Home {
             Source::Recommendation(kind) => self.recommendations.apply(kind, response),
             Source::Subscriptions => self.subscriptions.apply(response),
             Source::History => self.settings.apply(response),
+            Source::Player => {
+                if let Some(detail) = &mut self.player_detail {
+                    detail.apply(response);
+                }
+            }
         }
     }
 
@@ -209,6 +242,17 @@ impl Home {
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         if area.width < 24 || area.height < 8 {
             frame.render_widget(Paragraph::new("请放大终端窗口").centered(), area);
+            return;
+        }
+        if let Some(detail) = &mut self.player_detail {
+            detail.draw(
+                frame,
+                centered(
+                    area,
+                    112.min(area.width.saturating_sub(2)),
+                    area.height.saturating_sub(2),
+                ),
+            );
             return;
         }
         match self.screen {

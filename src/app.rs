@@ -137,6 +137,7 @@ struct App {
 }
 
 const BROWSE_SLOTS: usize = subscriptions::Source::SLOTS;
+const PLAYLIST_ADDED_NOTICE: &str = "已置于播放列表首位";
 
 impl Drop for App {
     fn drop(&mut self) {
@@ -311,7 +312,7 @@ impl App {
                             .as_deref()
                             .is_some_and(|notice| notice.starts_with("无法播放："))
                         {
-                            self.notice = Some("已加入播放列表".into());
+                            self.notice = Some(PLAYLIST_ADDED_NOTICE.into());
                             self.added_notice_until = Some(Instant::now() + Duration::from_secs(3));
                         }
                         if !self.exiting && !self.logging_out {
@@ -639,6 +640,28 @@ impl App {
             }
             return;
         }
+        if key == KeyCode::Char('i') {
+            if self.player_shown()
+                && !self.exiting
+                && !self.logging_out
+                && let Some(current) = &self.player.current
+                && let View::Home(home) = &mut self.view
+            {
+                let requests = home.open_player_detail(content::Episode {
+                    eid: current.eid.clone(),
+                    title: current.title.clone(),
+                    duration: current.duration.map(|seconds| seconds as u64),
+                    ..Default::default()
+                });
+                self.player_visible = false;
+                self.player_expanded = false;
+                self.help.open = false;
+                for request in requests {
+                    self.browse(subscriptions::Source::Player, request);
+                }
+            }
+            return;
+        }
         if let KeyCode::Char(direction @ ('a' | 'd')) = key {
             self.player.seek(if direction == 'a' { -15 } else { 15 });
             return;
@@ -691,8 +714,7 @@ impl App {
                 }
                 Action::LoadPlaylist => self.load_playlist(),
                 Action::Login => self.start(false),
-                Action::Play(eid) => self.play(eid),
-                Action::PlayAndAdd(eid) => {
+                Action::Play(eid) | Action::PlayAndAdd(eid) => {
                     self.play(eid.clone());
                     self.add(eid);
                 }
@@ -786,13 +808,22 @@ impl App {
     }
 
     fn add(&mut self, eid: String) {
-        if self.exiting
-            || self.logging_out
-            || self.account.is_none()
-            || self.add_queue.contains(&eid)
+        if self.exiting || self.logging_out || self.account.is_none() {
+            return;
+        }
+        if self.add_task.is_some()
+            && self.add_queue.len() == 1
+            && self.add_queue.front() == Some(&eid)
         {
             return;
         }
+        // Preserve the operation already sent; order pending requests by the last user action.
+        let mut index = 0;
+        self.add_queue.retain(|queued| {
+            let keep = self.add_task.is_some() && index == 0 || queued != &eid;
+            index += 1;
+            keep
+        });
         if self
             .add_retry_at
             .is_some_and(|until| Instant::now() < until)
@@ -1076,7 +1107,7 @@ impl App {
             .is_some_and(|until| Instant::now() >= until)
         {
             self.added_notice_until = None;
-            if self.notice.as_deref() == Some("已加入播放列表") {
+            if self.notice.as_deref() == Some(PLAYLIST_ADDED_NOTICE) {
                 self.notice = None;
             }
         }
@@ -2039,6 +2070,108 @@ mod tests {
             },
         );
         assert!(!app.player_visible);
+    }
+
+    #[tokio::test]
+    async fn player_i_opens_current_episode_with_shared_tabs_and_returns_to_selected_list_item() {
+        use wiremock::matchers::{body_json, query_param};
+        let server = MockServer::start().await;
+        Mock::given(path("/v1/episode/get")).and(query_param("eid", "episode"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{
+                "eid":"episode","title":"当前收听详情","shownotes":"# 当前音频完整简介","podcast":{"title":"当前播客"}
+            }}))).expect(1).mount(&server).await;
+        Mock::given(path("/v1/comment/list-primary"))
+            .and(body_json(
+                json!({"owner":{"id":"episode","type":"EPISODE"},"order":"HOT","limit":20}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":[{"id":"c","text":"当前音频的评论"}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app(directory.path().to_owned());
+        app.content = content::Api::for_test(server.uri());
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        app.sender = sender;
+        app.activate(credentials());
+        with_playlist(&mut app, &["selected", "other"]);
+        let (player, mut controls) = Player::simulated();
+        app.player = player;
+        app.key(KeyCode::Down);
+        app.player_visible = false;
+        let page = rendered(&mut app);
+        app.key(KeyCode::Char('i'));
+        assert_eq!(rendered(&mut app), page);
+        app.key(KeyCode::Char('t'));
+        app.key(KeyCode::Char('T'));
+        app.key(KeyCode::Char('?'));
+        let play_request = app.play_request;
+        app.key(KeyCode::Char('i'));
+        assert!(!app.player_visible && !app.player_expanded && !app.help.open);
+        for _ in 0..2 {
+            let (generation, update) =
+                tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(matches!(
+                update,
+                Update::Browse {
+                    source: subscriptions::Source::Player,
+                    ..
+                }
+            ));
+            app.apply(generation, update);
+        }
+        let detail = rendered(&mut app).replace(' ', "");
+        assert!(detail.contains("当前收听详情") && detail.contains("当前音频完整简介"));
+        assert!(!detail.contains("当前音频的评论"));
+        app.key(KeyCode::Tab);
+        assert!(
+            rendered(&mut app)
+                .replace(' ', "")
+                .contains("当前音频的评论")
+        );
+        assert_eq!(app.play_request, play_request);
+        assert_eq!(app.player.current.as_ref().unwrap().eid, "episode");
+        assert_eq!(app.player.current.as_ref().unwrap().position, 10.0);
+        assert!(controls.try_recv().is_err());
+        assert!(app.add_queue.is_empty());
+        app.key(KeyCode::Esc);
+        assert_eq!(rendered(&mut app), page);
+        let View::Home(home) = &mut app.view else {
+            unreachable!()
+        };
+        assert!(matches!(home.key(KeyCode::Enter), Action::Play(id) if id == "other"));
+    }
+
+    #[tokio::test]
+    async fn manual_playlist_play_promotes_current_episode_and_pending_additions_follow_latest_choice()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app(directory.path().to_owned());
+        app.activate(credentials());
+        with_playlist(&mut app, &["before", "episode"]);
+        app.key(KeyCode::Down);
+        app.key(KeyCode::Enter);
+        assert_eq!(app.add_queue, VecDeque::from(["episode".to_owned()]));
+        assert!(app.add_task.is_some());
+        app.add("b".into());
+        app.add("episode".into());
+        assert_eq!(
+            app.add_queue,
+            VecDeque::from(["episode".to_owned(), "b".to_owned(), "episode".to_owned()])
+        );
+        app.add("b".into());
+        assert_eq!(
+            app.add_queue,
+            VecDeque::from(["episode".to_owned(), "episode".to_owned(), "b".to_owned()])
+        );
+        // No yield: cancellation keeps this dispatch test independent of network and mpv.
+        app.add_task.take().unwrap().abort();
     }
 
     #[tokio::test]
@@ -3392,11 +3525,11 @@ mod tests {
         Mock::given(path("/v1/playlist/patch"))
             .respond_with(move |request: &wiremock::Request| {
                 let body: serde_json::Value = request.body_json().unwrap();
-                assert_eq!(body["ops"], json!([{"action":"add","item":"a","pos":1}]));
+                assert_eq!(body["ops"], json!([{"action":"add","item":"a","pos":0}]));
                 if fail_addition {
                     return ResponseTemplate::new(503);
                 }
-                shared.lock().unwrap().push("a");
+                shared.lock().unwrap().insert(0, "a");
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"data":{"kind":"ACK","id":body["id"],"sha":"added"}}))
                     .set_delay(Duration::from_millis(50))
@@ -3493,10 +3626,16 @@ mod tests {
         let View::Home(home) = &app.view else {
             unreachable!()
         };
+        assert_eq!(home.next_after("a").as_deref(), Some("queued"));
         assert_eq!(
-            home.next_after("queued").as_deref(),
-            if fail_addition { None } else { Some("a") }
+            *ids.lock().unwrap(),
+            if fail_addition {
+                vec!["queued"]
+            } else {
+                vec!["a", "queued"]
+            }
         );
+        assert!(home.next_after("queued").is_none());
         if fail_addition {
             assert!(app.notice.as_deref().unwrap().contains("加入播放列表失败"));
             assert!(app.play_task.is_some());

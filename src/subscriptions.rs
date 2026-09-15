@@ -25,16 +25,18 @@ pub enum Source {
     Subscriptions,
     Recommendation(Kind),
     History,
+    Player,
 }
 
 impl Source {
-    pub const SLOTS: usize = 4 * (2 + Kind::ALL.len());
+    pub const SLOTS: usize = 4 * (3 + Kind::ALL.len());
 
     pub fn slot(self) -> usize {
         4 * match self {
             Self::Subscriptions => 0,
             Self::Recommendation(kind) => kind.index() + 1,
             Self::History => Kind::ALL.len() + 1,
+            Self::Player => Kind::ALL.len() + 2,
         }
     }
 }
@@ -65,6 +67,7 @@ impl Request {
                 }
                 Source::Subscriptions => api.subscriptions(&credentials, cursor).await,
                 Source::History => api.listening_history(&credentials, cursor).await,
+                Source::Player => Err(Error::InvalidResponse),
             }),
             Self::ListeningTime => {
                 Response::ListeningTime(api.listening_seconds(&credentials).await)
@@ -347,9 +350,7 @@ impl Subscriptions {
 
     pub fn help_context(&self) -> crate::help::Context {
         if let Some(detail) = &self.detail {
-            crate::help::Context::Episode {
-                needs_login: detail.load.needs_login() || detail.comments.load.needs_login(),
-            }
+            detail.help_context()
         } else if matches!(self.source, Source::Recommendation(_)) {
             crate::help::Context::Recommendations {
                 needs_login: self.feed.load.needs_login(),
@@ -438,27 +439,10 @@ impl Subscriptions {
     }
     pub fn apply(&mut self, response: Response) {
         match response {
-            Response::ListeningTime(_) => {}
             Response::Feed(result) => self.feed.apply(result),
-            Response::Detail(eid, result) => {
-                if let Some(detail) = &mut self.detail
-                    && detail.episode.eid == eid
-                {
-                    match result {
-                        Ok(episode) => {
-                            detail.episode = episode;
-                            detail.note_width = 0;
-                            detail.load.finish(None);
-                        }
-                        Err(error) => detail.load.finish(Some(error)),
-                    }
-                }
-            }
-            Response::Comments(eid, result) => {
-                if let Some(detail) = &mut self.detail
-                    && detail.episode.eid == eid
-                {
-                    detail.comments.apply(result);
+            response => {
+                if let Some(detail) = &mut self.detail {
+                    detail.apply(response);
                 }
             }
         }
@@ -491,6 +475,7 @@ impl Subscriptions {
             Source::Subscriptions => "订阅列表".to_owned(),
             Source::Recommendation(kind) => format!("推荐列表 · {}", kind.label()),
             Source::History => "收听历史".to_owned(),
+            Source::Player => "当前音频".to_owned(),
         };
         frame.render_widget(
             Paragraph::new(format!("{title} · {}", self.feed.label()))
@@ -556,7 +541,7 @@ impl Subscriptions {
     }
 }
 
-struct Detail {
+pub(crate) struct Detail {
     episode: Episode,
     load: Load,
     comments: Paged<Comment>,
@@ -570,7 +555,7 @@ struct Detail {
 }
 
 impl Detail {
-    fn new(episode: Episode) -> Self {
+    pub(crate) fn new(episode: Episode) -> Self {
         let mut load = Load::default();
         load.begin();
         let mut comments = Paged::default();
@@ -588,7 +573,30 @@ impl Detail {
             comment_line_count: 0,
         }
     }
-    fn key(&mut self, key: KeyCode) -> Action {
+    pub(crate) fn help_context(&self) -> crate::help::Context {
+        crate::help::Context::Episode {
+            needs_login: self.load.needs_login() || self.comments.load.needs_login(),
+        }
+    }
+
+    pub(crate) fn apply(&mut self, response: Response) {
+        match response {
+            Response::Detail(eid, result) if self.episode.eid == eid => match result {
+                Ok(episode) => {
+                    self.episode = episode;
+                    self.note_width = 0;
+                    self.load.finish(None);
+                }
+                Err(error) => self.load.finish(Some(error)),
+            },
+            Response::Comments(eid, result) if self.episode.eid == eid => {
+                self.comments.apply(result)
+            }
+            _ => (),
+        }
+    }
+
+    pub(crate) fn key(&mut self, key: KeyCode) -> Action {
         let eid = self.episode.eid.clone();
         match key {
             KeyCode::Enter if self.load.needs_login() || self.comments.load.needs_login() => {
@@ -644,7 +652,7 @@ impl Detail {
             }
         }
     }
-    fn draw(&mut self, frame: &mut Frame, area: Rect) {
+    pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let [tabs, title, meta, body] = Layout::vertical([
             Constraint::Length(2),
             Constraint::Length(1),

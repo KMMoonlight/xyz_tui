@@ -720,13 +720,28 @@ impl Api {
         present: bool,
     ) -> Result<(), Error> {
         let access = access_header(credentials)?;
+        let matches_target = |list: &[String]| {
+            if present {
+                list.first().is_some_and(|item| item == eid)
+                    && list.iter().filter(|item| *item == eid).count() == 1
+            } else {
+                !list.iter().any(|item| item == eid)
+            }
+        };
         for _ in 0..3 {
             let queue = self.queue_revision(&access).await?;
-            let position = queue.list.iter().position(|item| item == eid);
-            if position.is_some() == present {
+            if matches_target(&queue.list) {
                 return Ok(());
             }
-            let position = position.unwrap_or(queue.list.len());
+            let mut ops = Vec::new();
+            for (position, item) in queue.list.iter().enumerate().rev() {
+                if item == eid {
+                    ops.push(json!({"action":"rem", "item":eid, "pos":position}));
+                }
+            }
+            if present {
+                ops.push(json!({"action":"add", "item":eid, "pos":0}));
+            }
             let id = uuid::Uuid::new_v4().to_string().to_uppercase();
             let response = self
                 .client
@@ -737,7 +752,7 @@ impl Api {
                 .json(&json!({
                     "id": id,
                     "base": queue.sha,
-                    "ops": [{"action":if present { "add" } else { "rem" }, "item":eid, "pos":position}]
+                    "ops": ops
                 }))
                 .send()
                 .await?;
@@ -761,7 +776,7 @@ impl Api {
                         return Err(Error::InvalidResponse);
                     }
                     let confirmed = self.queue_revision(&access).await?;
-                    return if confirmed.list.iter().any(|item| item == eid) == present {
+                    return if matches_target(&confirmed.list) {
                         Ok(())
                     } else {
                         Err(Error::PlaylistChanged)

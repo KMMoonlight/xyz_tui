@@ -1451,7 +1451,7 @@ async fn details_and_read_only_comments_preserve_body_and_paginate() {
 }
 
 #[tokio::test]
-async fn addition_appends_rebases_and_is_idempotent() {
+async fn addition_prepends_rebases_and_is_idempotent() {
     use std::sync::{Arc, Mutex};
     let server = MockServer::start().await;
     let state = Arc::new(Mutex::new((vec!["a"], 0)));
@@ -1471,16 +1471,13 @@ async fn addition_appends_rebases_and_is_idempotent() {
             let body: serde_json::Value = request.body_json().unwrap();
             let mut state = shared.lock().unwrap();
             assert_eq!(body["base"], format!("r{}", state.1));
-            assert_eq!(
-                body["ops"],
-                json!([{"action":"add","item":"b","pos":state.0.len()}])
-            );
+            assert_eq!(body["ops"], json!([{"action":"add","item":"b","pos":0}]));
             if state.1 == 0 {
                 state.0.push("concurrent");
                 state.1 += 1;
                 ResponseTemplate::new(409)
             } else {
-                state.0.push("b");
+                state.0.insert(0, "b");
                 state.1 += 1;
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"data":{"kind":"ACK","id":body["id"],"sha":"r2"}}))
@@ -1492,7 +1489,55 @@ async fn addition_appends_rebases_and_is_idempotent() {
     let api = content::Api::for_test(server.uri());
     api.add_to_playlist(&credentials(), "b").await.unwrap();
     api.add_to_playlist(&credentials(), "b").await.unwrap();
-    assert_eq!(state.lock().unwrap().0, ["a", "concurrent", "b"]);
+    assert_eq!(state.lock().unwrap().0, ["b", "a", "concurrent"]);
+}
+
+#[tokio::test]
+async fn existing_episode_moves_to_front_in_one_patch_and_rebases_its_position() {
+    use std::sync::{Arc, Mutex};
+    let server = MockServer::start().await;
+    let state = Arc::new(Mutex::new((vec!["a", "b", "c"], 0)));
+    let shared = state.clone();
+    Mock::given(path("/v1/playlist/pull"))
+        .respond_with(move |_: &wiremock::Request| {
+            let state = shared.lock().unwrap();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data":{"list":state.0,"sha":format!("r{}",state.1)}}))
+        })
+        .mount(&server)
+        .await;
+    let shared = state.clone();
+    Mock::given(path("/v1/playlist/patch"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            let mut state = shared.lock().unwrap();
+            let position = state.0.iter().position(|item| *item == "b").unwrap();
+            assert_eq!(body["base"], format!("r{}", state.1));
+            assert_eq!(
+                body["ops"],
+                json!([
+                    {"action":"rem","item":"b","pos":position},
+                    {"action":"add","item":"b","pos":0}
+                ])
+            );
+            if state.1 == 0 {
+                state.0.insert(0, "concurrent");
+                state.1 += 1;
+                return ResponseTemplate::new(409);
+            }
+            state.0.remove(position);
+            state.0.insert(0, "b");
+            state.1 += 1;
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data":{"kind":"ACK","id":body["id"],"sha":"r2"}}))
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let api = content::Api::for_test(server.uri());
+    api.add_to_playlist(&credentials(), "b").await.unwrap();
+    api.add_to_playlist(&credentials(), "b").await.unwrap();
+    assert_eq!(state.lock().unwrap().0, ["b", "concurrent", "a", "c"]);
 }
 
 #[tokio::test]
@@ -1500,7 +1545,7 @@ async fn addition_does_not_claim_success_without_server_confirmation() {
     let server = MockServer::start().await;
     Mock::given(path("/v1/playlist/pull"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({"data":{"list":["a"],"sha":"r1"}})),
+            ResponseTemplate::new(200).set_body_json(json!({"data":{"list":["a","b"],"sha":"r1"}})),
         )
         .mount(&server)
         .await;
