@@ -2,6 +2,28 @@
 
 Rust + Ratatui 小宇宙客户端，支持 macOS / Linux，已实现扫码登录、账号播放列表、订阅更新、实时榜单与推荐、收听时长与历史、单集详情与音频播放。
 
+## Homebrew 安装与更新
+
+macOS 14+、Apple Silicon 用户可以直接安装，无需另装 Rust。GitHub 仓库和安装包保持私有，下载时复用有仓库读取权限的 `gh` 登录：
+
+```sh
+brew install gh
+gh auth login
+brew install KMMoonlightQ/tools/xyz-tui
+xyz
+```
+
+Homebrew 会自动安装播放依赖 `mpv`。已有可用 `gh` 登录时，无需重复登录。安装后使用 `xyz` 启动，`xyz --version` 可查看版本，`xyz --help` 可查看启动说明；也保留 `xyz-tui` 作为兼容入口。
+
+更新：
+
+```sh
+brew update
+brew upgrade KMMoonlightQ/tools/xyz-tui
+```
+
+## 从源码运行
+
 播放需要 `mpv`。macOS 安装后启动：
 
 ```sh
