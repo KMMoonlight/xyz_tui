@@ -265,3 +265,69 @@ flowchart LR
 验证范围：实际 mpv 静音 WAV 测试覆盖定位、解码、暂停、继续与结束；真实账号试播覆盖 Enter 续听、返回菜单、进入设置、全局 Space 和退出同步。最终界面位置 47:48，退出后 API 读回 2868 秒，账号原有四条队列保留。云端补丁做了空操作 ACK 实测；实际删除、并发修改、重复删除与确认失败通过模拟服务验证，没有为测试移除账号中的真实单集。
 
 账号 API 请求共用串行凭据管理。选择变化取消等待者时，正在进行的 token 轮转仍会完成，并先由主事件循环原子保存，再重试请求；跨登录会话的响应不会覆盖当前凭据。对应取消、并发续期、暂停期间尚有上传在途、服务器限流及列表移除失败均有回归测试。
+
+### 2026-09-15 字幕接口补充实测
+
+使用现有账号对公开单集 `6aa37bcd492687f6aad83995` 进行了只读验证。详情中的 `transcript.mediaId` 可用于 `POST /v1/episode-transcript/get`，请求体为 `{eid, mediaId}`。仅带 access token、User-Agent 和 Content-Type 的请求返回 HTTP 400；补齐 `os`、`app-version`、`app-buildno`、`applicationid`、`local-time`、`x-jike-device-id` 后成功。测试值为 Android、2.99.1、1362、app.podcast.cosmos，User-Agent 为 `Xiaoyuzhou/2.99.1(android 28)`。本次未逐一剥离这些请求头来判断每项是否必需。
+
+响应 `data` 含 `key`、`vendorDeclaration`、`transcriptUrl`、`highlightUrl`。用相同 User-Agent 读取 `transcriptUrl`，不携带账号凭据，得到 633 段 JSON 数组，大小 127,752 字节；每段含 `text` 字符串和 `startMs` 整数。新 Rust 客户端从单集解析到字幕下载、解析的完整只读链路也已验证成功；未保存逐字稿正文或签名 URL。
+
+客户端优先使用 `transcriptMediaId`，其次 `transcript.mediaId`，最后 `media.id`。字幕 URL 请求复用账号续期管理；CDN 下载在账号请求锁外完成且不发送凭据。字幕按时间戳匹配实际播放位置，约每 250 毫秒更新；无字幕、空字幕和获取失败不会增加界面占位或提示。网络错误按退避间隔有限重试，切歌、停止和退出会取消当前字幕加载并忽略旧响应。
+
+## 14. 2026-09-15 订阅更新、详情和只读评论
+
+本次用现有账号只读验证了 `POST /v2/inbox/list`，请求体为 `{"limit":20}`。仅发送 access token 时返回 HTTP 400；在现有 `xyz-tui/0.1.0` User-Agent 上增加保存的 `x-jike-device-id` 即可成功，无需复制移动设备版本头。第一、二页分别返回 15、14 项；客户端不把请求的 limit 当成实际页长，也不因少于 20 项而提前终止。响应 `data` 直接包含单集，`loadMoreKey` 是对象，原样回传即可读取下一页。字段包括 `eid`、`title`、`duration`、`pubDate`、`podcast.title`、简短 `description`。对应公开实现见 [Inbox](https://github.com/sorosliu1029/cosmos-wormhole/blob/a40fff0e2854d04cb4ab3f1e65bb1be32e2ec2c1/src/cosmos_wormhole/endpoints/inbox.py)。
+
+详情仍用 `GET /v1/episode/get?eid=…`，实测包含 HTML `shownotes` 和简短 `description`。优先渲染完整 shownotes，缺失时回退 description。CommonMark 解析器与 HTML 文本排版配合，展示标题、列表、强调、代码和链接样式，清除终端控制字符；渲染过程不下载外部资源。
+
+评论使用 `POST /v1/comment/list-primary`，body 为 `{"owner":{"id":"单集 eid","type":"EPISODE"},"order":"HOT","limit":20}`，携带 access token 和设备标识。实测主评论包含 `id`、`text`、`author.nickname`、`createdAt`、`likeCount`；无评论返回空数组。有评论的单集成功读到 5 项。客户端支持原样回传评论游标；真实评论多页尚未覆盖，游标分支通过模拟 HTTP 测试。未接入创建、回复、点赞或删除评论接口。公开参数来源见 [Comment](https://github.com/sorosliu1029/cosmos-wormhole/blob/a40fff0e2854d04cb4ab3f1e65bb1be32e2ec2c1/src/cosmos_wormhole/endpoints/comment.py)。
+
+`y` 加入队列复用带版本的 `playlist/pull` → `playlist/patch` → 读回确认流程，追加操作为 `{"action":"add","item":"单集 eid","pos":当前队列长度}`。重复项直接成功，不移动原有位置；冲突重新读取队列计算末尾位置，最多三次。加入、重复加入、冲突和未确认 ACK 通过模拟服务测试；本次未对真实账号执行新增或删除操作。
+
+真实 TUI 已检查订阅前两页、列表与详情往返、完整简介、主评论及滚动。自动化测试覆盖不透明游标、重复项和循环游标、失败保留页面、限流、登录续期、跨页面和跨账号的过时响应、两次 Enter 的不同操作，以及窄窗口绘制。发布时间在解析时区后转为北京时间，缺失时间与时长明确显示未知。
+
+## 15. 2026-09-15 启动恢复最近收听
+
+登录完成后以 `{}` 请求 `POST /v1/episode-played/list-history`，携带账号凭据与设备标识，读取服务端历史顺序中的第一项 `data[].episode`，再通过 `/v1/playback-progress/list` 按 `eid` 获取精确秒数。历史中的完成标记不替代播放进度；空历史保持空播放区，缺失或无效进度明确报错。历史解析使用本地已有响应结构，并通过本次实际启动程序验证：成功恢复云端最近单集、暂停位置和对应字幕，字幕连续排列，分割线无文字。
+
+启动恢复只填充播放器的暂停状态，播放区默认隐藏；后台加载和完成赋值都不会自动展开，按 `t` 可查看。恢复不启动 mpv、不解析音频地址，也不会上报新的收听记录。按 `Space` 时再取当前音频地址及最新云端进度，展开播放区后播放；已完成的单集沿用从头播放的规则。手动选歌、退出和跨账号操作会取消恢复等待，过时响应不能覆盖当前播放。读取失败可按 `Space` 重试，429 遵循服务端指定等待时间。
+
+真实启动检查未播放音频或修改播放列表。模拟服务覆盖历史顺序、精确小数秒、完成与缺失进度、空历史、401/429、暂停恢复不产生进度上传、按空格重新获取最新进度，以及旧响应与手动播放之间的竞争。
+
+## 16. 2026-09-15 完整榜单、编辑推荐和发现页单集
+
+使用已保存的登录和设备标识只读验证了以下接口，`xyz-tui/0.1.0` User-Agent 即可正常访问，无需移动设备版本头。请求仅携带 access token 和 `x-jike-device-id`，凭据不会进入日志或测试样例。
+
+| 内容 | 请求 | 实测响应 |
+| --- | --- | --- |
+| 最热榜 | `GET /v1/top-list/get?category=HOT_EPISODES_IN_24_HOURS` | `data.items[].item`，15 条单集 |
+| 锋芒榜 | 同上，category 为 `SKYROCKET_EPISODES` | 15 条单集 |
+| 新星榜 | 同上，category 为 `NEW_STAR_EPISODES` | 15 条单集 |
+| 编辑推荐 | `POST /v1/editor-pick/list-history`，body `{}` | `data[].picks[].episode`，5 天共 15 条；最新日期为 2026-09-15 |
+| 为你推荐 | `POST /v1/discovery-feed/list`，body `{"returnAll":false}` | 混合模块数组 `data[]`，分页令牌 `loadMoreKey` |
+
+完整榜单的 `data` 还包含 `category`、`targetType: "EPISODE"`、`publishDate` 等字段，本次三榜均为 `2026-09-14T16:00:00.000Z`（北京时间 9 月 15 日）。发现页的 `TOP_LIST` 仅包含每榜前三条，不能充当完整榜单；客户端使用独立榜单接口，保留服务端顺序并显示名次，不把 15 条写死为接口上限。
+
+编辑推荐第一、第二页各 15 条，游标实测为 ISO 时间字符串，按 `loadMoreKey` 原样回传；不从单集发布时间推导精选日期。展示按服务端日期及当日精选顺序展开的单集列表。
+
+发现页首屏实测包含 `DISCOVERY_HEADER`、`PRESET_CONTENT`、`EDITOR_PICK`、`TOP_LIST`、`CATEGORY_ENTRANCE`。为你推荐读取 `PRESET_CONTENT.data.contents[].episode`、`DISCOVERY_COLLECTION.data[]` 中 `targetType == EPISODE` 的 `target[].episode`，以及 `DISCOVERY_PICK.data[].episode`；跳过横幅、入口和仅有播客的模块，榜单和编辑精选使用各自分类。后续页面仅有不支持的模块时继续跟随游标，最多跨 8 页并检查重复令牌，避免无限请求；解析错误、循环分页、HTTP 401/429/5xx 保留原有页面并提供重试。
+
+五个分类各自缓存分页、选择和详情状态，请求按来源及列表/详情/评论分别管理；后台响应不能覆盖另一个分类或订阅列表。列表共用订阅页的两行布局，单集共用原详情组件，包括 Markdown/HTML 简介、只读热评、播放续听和加入播放列表操作。分类切换快捷键只在列表生效，详情中的 Tab 继续切换简介和评论。
+
+已通过真实 TUI 只读验证完整榜单、编辑推荐前两页、为你推荐前两页、单集简介及评论、返回后保留位置。验证使用临时会话副本，未播放音频或修改云端播放列表。模拟服务覆盖榜单顺序、精选分页、发现页过滤及去重、循环游标、失败重试、登录续期、分类间请求隔离和不同终端尺寸。
+
+公开请求定义参考：[完整榜单](https://github.com/tankxu/xiaoyuzhou-server/blob/73e7806f68db021328bddb79409d86158708eb46/handlers/top.go)、[发现页与编辑精选](https://github.com/tankxu/xiaoyuzhou-server/blob/73e7806f68db021328bddb79409d86158708eb46/handlers/discovery.go)。响应解析以上述实际官方 API 结果为准，不使用包装服务额外的 `code/data` 层级。
+
+## 17. 单集详情与评论标签
+
+单集页复用推荐列表的标签样式，在顶部展示“详情 / 评论”，默认进入详情，按 Tab 或 Shift+Tab 切换。标题和播客、时长、发布时间在两页保持显示；简介与只读评论分别占据剩余完整区域，各自保留滚动位置。评论翻页仅在评论标签生效，刷新和重试仅作用于当前标签。接口与后台加载流程不变，订阅和所有推荐分类统一使用该组件。
+
+## 18. 2026-09-15 设置页收听统计与历史
+
+通过当前账号只读确认 `GET /v1/profile/get` 返回 `data.uid`，再以该 uid 请求 `GET /v1/user-stats/get?uid=…`，累计收听时长来自 `data.totalPlayedSeconds`（整数秒）。两次请求均只发送 access token、保存的设备标识和现有 User-Agent。缺失、null 或负数不解释为零；展示为小时、分钟，刷新失败保留上次成功值。请求定义参考 [用户统计源码](https://github.com/ultrazg/xyz/blob/22cfe7848a98b393a5f9f62c5e9a4eea2592eb1b/handlers/profile.go)。
+
+历史以 `{}` 请求 `POST /v1/episode-played/list-history`，读取 `data[].episode`；下一页原样传回 `loadMoreKey`。保留服务器顺序，重复单集去重，空页携带游标或循环游标报错并保留当前页。列表直接复用订阅与推荐列表的两行布局、分页缓存、标题高亮和单集详情组件；第二行仍展示播客名、单集总时长、发布日期。历史与统计独立加载、报错和限流，全部通过共享账号流程续期，响应按来源、账号和请求序号隔离。
+
+设置页默认选中历史，Tab / Shift+Tab 切到右上角退出登录；进入单集后 Tab 继续切换简介与评论。`r` 更新云端统计及历史，返回再进入保留页码、选择和已有数据。累计时长以服务端统计为准，不通过历史单集时长或播放位置估算，也不在浏览时上报新的收听记录。
+
+真实 TUI 已只读检查累计时长、历史前两页、详情与评论；未播放音频或修改云端队列。模拟服务与界面测试覆盖返回列表保留选择、数据解析、游标、失败保留、429 等待、401 续期、过时响应、小窗口、焦点及原有播放/登录回归。

@@ -1,6 +1,6 @@
 use std::{fs, time::Duration};
 
-use ratatui::{Terminal, backend::TestBackend, style::Color};
+use ratatui::{Terminal, backend::TestBackend, layout::Rect, style::Color};
 use serde_json::json;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -15,6 +15,386 @@ use crate::{
 };
 
 const QR_URL: &str = "https://h5.xiaoyuzhoufm.com/oauth?qrcode_id=6aa8073a7c72d6f274950175";
+
+#[tokio::test]
+async fn listening_seconds_reads_current_user_stats_and_preserves_unknown_values() {
+    for (body, expected) in [
+        (json!({"totalPlayedSeconds":9474419}), Some(9474419)),
+        (json!({"totalPlayedSeconds":0}), Some(0)),
+        (json!({}), None),
+        (json!({"totalPlayedSeconds":null}), None),
+        (json!({"totalPlayedSeconds":-1}), None),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(path("/v1/profile/get"))
+            .and(method("GET"))
+            .and(header("x-jike-access-token", "test-access"))
+            .and(header("x-jike-device-id", "device"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data":{"uid":"user+id"}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/v1/user-stats/get"))
+            .and(method("GET"))
+            .and(query_param("uid", "user+id"))
+            .and(header("x-jike-access-token", "test-access"))
+            .and(header("x-jike-device-id", "device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":body})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = content::Api::for_test(server.uri())
+            .with_device_id("device".into())
+            .listening_seconds(&credentials())
+            .await;
+        match expected {
+            Some(seconds) => assert_eq!(result.unwrap(), seconds),
+            None => assert!(matches!(result, Err(Error::InvalidResponse))),
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn listening_history_preserves_order_and_opaque_cursor_without_writes() {
+    for cursor in [
+        json!("2026-09-14T00:00:00Z"),
+        json!({"playedAt":123,"id":"opaque"}),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(path("/v1/episode-played/list-history"))
+            .and(method("POST"))
+            .and(body_json(json!({})))
+            .and(header("x-jike-access-token", "test-access"))
+            .and(header("x-jike-device-id", "device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[
+                {"episode":subscription_episode("b")},
+                {"episode":subscription_episode("a")},
+                {"episode":subscription_episode("b")}
+            ], "loadMoreKey":cursor})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/v1/episode-played/list-history"))
+            .and(body_json(json!({"loadMoreKey":cursor})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[]})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = content::Api::for_test(server.uri()).with_device_id("device".into());
+        let first = api.listening_history(&credentials(), None).await.unwrap();
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|e| e.eid.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+        assert_eq!(first.cursor, Some(cursor));
+        let last = api
+            .listening_history(&credentials(), first.cursor)
+            .await
+            .unwrap();
+        assert!(last.items.is_empty() && last.cursor.is_none());
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn settings_endpoints_propagate_auth_rate_limits_and_invalid_pages() {
+    for endpoint in [
+        "/v1/profile/get",
+        "/v1/user-stats/get",
+        "/v1/episode-played/list-history",
+    ] {
+        for status in [401, 429] {
+            let server = MockServer::start().await;
+            if endpoint == "/v1/user-stats/get" {
+                Mock::given(path("/v1/profile/get"))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_json(json!({"data":{"uid":"me"}})),
+                    )
+                    .mount(&server)
+                    .await;
+            }
+            Mock::given(path(endpoint))
+                .respond_with(ResponseTemplate::new(status).insert_header("retry-after", "30"))
+                .mount(&server)
+                .await;
+            let api = content::Api::for_test(server.uri());
+            let result = if endpoint.ends_with("list-history") {
+                api.listening_history(&credentials(), None).await.map(|_| 0)
+            } else {
+                api.listening_seconds(&credentials()).await
+            };
+            if status == 401 {
+                assert!(matches!(
+                    result,
+                    Err(Error::Http(reqwest::StatusCode::UNAUTHORIZED))
+                ));
+            } else {
+                assert!(matches!(result, Err(Error::RateLimited(delay)) if delay.as_secs() == 30));
+            }
+        }
+    }
+    for body in [
+        json!({"data":[],"loadMoreKey":"more"}),
+        json!({"data":[{"episode":null}]}),
+        json!({"data":[{"episode":{"eid":" ","title":"bad"}}]}),
+        json!({"data":[{"episode":subscription_episode("a")}],"loadMoreKey":"same"}),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(path("/v1/episode-played/list-history"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let result = content::Api::for_test(server.uri())
+            .listening_history(&credentials(), Some(json!("same")))
+            .await;
+        assert!(matches!(result, Err(Error::InvalidResponse)));
+    }
+}
+
+#[tokio::test]
+async fn recent_episode_uses_history_order_and_exact_progress_without_resolving_audio() {
+    let server = MockServer::start().await;
+    Mock::given(path("/v1/episode-played/list-history"))
+        .and(method("POST")).and(body_json(json!({})))
+        .and(header("x-jike-access-token", "test-access"))
+        .and(header("x-jike-device-id", "test-device"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[
+            {"episode":{"eid":"recent","pid":"podcast","title":"最近收听", "duration":120,"transcriptMediaId":"native"}},
+            {"episode":{"eid":"older","pid":"podcast","title":"旧单集"}}
+        ],"loadMoreKey":"older-page"}))).expect(1).mount(&server).await;
+    Mock::given(path("/v1/playback-progress/list"))
+        .and(body_json(json!({"eids":["recent"]})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[
+            {"eid":"older","progress":50},{"eid":"recent","progress":12.5}
+        ]})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let recent = content::Api::for_test(server.uri())
+        .with_device_id("test-device".into())
+        .recent_episode(&credentials())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recent.episode.eid, "recent");
+    assert_eq!(recent.episode.title, "最近收听");
+    assert_eq!(recent.progress, 12.5);
+    assert_eq!(recent.transcript_media_id.as_deref(), Some("native"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn recent_episode_distinguishes_empty_history_missing_progress_and_http_errors() {
+    for (status, history, progress, expected) in [
+        (200, json!({"data":[]}), json!({"data":[]}), "empty"),
+        (
+            200,
+            json!({"data":[{"episode":{"eid":"a","pid":"p","title":"a","duration":60}}]}),
+            json!({"data":[]}),
+            "invalid",
+        ),
+        (
+            200,
+            json!({"data":[{"episode":{"eid":"a","pid":"p","title":"a","duration":60}}]}),
+            json!({"data":[{"eid":"a","progress":-1}]}),
+            "invalid",
+        ),
+        (
+            200,
+            json!({"data":[{"episode":{"eid":"a","pid":"p","title":"a","duration":60}}]}),
+            json!({"data":[{"eid":"a","progress":100}]}),
+            "finished",
+        ),
+        (
+            200,
+            json!({"data":[{"episode":null}]}),
+            json!({"data":[]}),
+            "invalid",
+        ),
+        (401, json!({}), json!({}), "auth"),
+        (429, json!({}), json!({}), "rate"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(path("/v1/episode-played/list-history"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("retry-after", "30")
+                    .set_body_json(history),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/v1/playback-progress/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(progress))
+            .mount(&server)
+            .await;
+        let result = content::Api::for_test(server.uri())
+            .recent_episode(&credentials())
+            .await;
+        match expected {
+            "empty" => {
+                assert!(matches!(result, Ok(None)));
+                assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            }
+            "finished" => assert_eq!(result.unwrap().unwrap().progress, 60.0),
+            "invalid" => assert!(matches!(result, Err(Error::InvalidResponse))),
+            "auth" => assert!(matches!(
+                result,
+                Err(Error::Http(reqwest::StatusCode::UNAUTHORIZED))
+            )),
+            "rate" => assert!(
+                matches!(result, Err(Error::RateLimited(delay)) if delay == Duration::from_secs(30))
+            ),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn transcript_media_id_prefers_native_metadata_over_audio_url() {
+    let server = MockServer::start().await;
+    Mock::given(path("/v1/playback-progress/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[]})))
+        .mount(&server)
+        .await;
+    let api = content::Api::for_test(server.uri());
+    for (native, transcript, media, expected) in [
+        (
+            Some("native"),
+            Some("transcript"),
+            Some("media"),
+            Some("native"),
+        ),
+        (
+            Some(""),
+            Some("transcript"),
+            Some("media"),
+            Some("transcript"),
+        ),
+        (None, None, Some("media"), Some("media")),
+        (None, None, None, None),
+    ] {
+        let _guard = Mock::given(path("/v1/episode/get"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{
+                "eid":"episode","pid":"podcast","title":"title","duration":60,
+                "transcriptMediaId":native,"transcript":{"mediaId":transcript},
+                "media":{"id":media,"source":{"url":"https://media.example/audio.mp3"}}
+            }})))
+            .mount_as_scoped(&server)
+            .await;
+        let playable = api.playable(&credentials(), "episode").await.unwrap();
+        assert_eq!(playable.transcript_media_id.as_deref(), expected);
+    }
+}
+
+#[tokio::test]
+async fn transcript_download_uses_app_headers_and_never_sends_credentials_to_cdn() {
+    let server = MockServer::start().await;
+    let cdn = MockServer::start().await;
+    Mock::given(path("/v1/episode-transcript/get"))
+        .and(method("POST"))
+        .and(header("x-jike-access-token", "test-access"))
+        .and(header("os", "android"))
+        .and(header("app-version", "2.99.1"))
+        .and(header("app-buildno", "1362"))
+        .and(header("applicationid", "app.podcast.cosmos"))
+        .and(header_exists("local-time"))
+        .and(header_exists("x-jike-device-id"))
+        .and(body_json(json!({"eid":"episode","mediaId":"native"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"data":{"data":{"transcriptUrl":format!("{}/captions",cdn.uri())}}}),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/captions"))
+        .and(header("user-agent", "Xiaoyuzhou/2.99.1(android 28)"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"startMs":0,"text":"first"},{"startMs":1000,"text":"second"}
+        ])))
+        .expect(1)
+        .mount(&cdn)
+        .await;
+    let api = content::Api::for_test(server.uri());
+    let url = api
+        .transcript_url(&credentials(), "episode", "native")
+        .await
+        .unwrap()
+        .unwrap();
+    let transcript = api.fetch_transcript(url).await.unwrap();
+    assert!(transcript.has_current(1.0));
+    for request in cdn.received_requests().await.unwrap() {
+        for header in [
+            "x-jike-access-token",
+            "x-jike-refresh-token",
+            "authorization",
+            "cookie",
+            "x-jike-device-id",
+        ] {
+            assert!(!request.headers.contains_key(header));
+        }
+    }
+}
+
+#[tokio::test]
+async fn transcript_absence_is_optional_but_unsafe_urls_and_bad_responses_are_rejected() {
+    let server = MockServer::start().await;
+    let api = content::Api::for_test(server.uri());
+    for response in [
+        ResponseTemplate::new(404),
+        ResponseTemplate::new(200).set_body_json(json!({"data":null})),
+        ResponseTemplate::new(200).set_body_json(json!({"data":{}})),
+        ResponseTemplate::new(200).set_body_json(json!({"data":{"transcriptUrl":null}})),
+        ResponseTemplate::new(200).set_body_json(json!({"data":{"transcriptUrl":""}})),
+    ] {
+        let _guard = Mock::given(path("/v1/episode-transcript/get"))
+            .respond_with(response)
+            .mount_as_scoped(&server)
+            .await;
+        assert!(
+            api.transcript_url(&credentials(), "episode", "media")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    for url in [
+        "file:///etc/passwd",
+        "https://user:secret@cdn.example/a.json",
+        "not a url",
+    ] {
+        let _guard = Mock::given(path("/v1/episode-transcript/get"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data":{"transcriptUrl":url}})),
+            )
+            .mount_as_scoped(&server)
+            .await;
+        assert!(matches!(
+            api.transcript_url(&credentials(), "episode", "media").await,
+            Err(Error::InvalidResponse)
+        ));
+    }
+    for status in [401, 429, 503] {
+        let _guard = Mock::given(path("/v1/episode-transcript/get"))
+            .respond_with(ResponseTemplate::new(status).insert_header("Retry-After", "45"))
+            .mount_as_scoped(&server)
+            .await;
+        let error = api
+            .transcript_url(&credentials(), "episode", "media")
+            .await
+            .unwrap_err();
+        match status {
+            429 => assert!(matches!(error,Error::RateLimited(delay) if delay.as_secs()==45)),
+            _ => assert!(matches!(error,Error::Http(code) if code.as_u16()==status)),
+        }
+    }
+}
 
 fn credentials() -> Credentials {
     Credentials {
@@ -534,7 +914,7 @@ fn qr_in_an_80_by_24_terminal_decodes_to_the_original_url() {
     let code = Code::new(QR_URL).unwrap();
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal
-        .draw(|frame| ui::draw(frame, Some(&code), "用小宇宙扫码", "r 刷新 · q 退出"))
+        .draw(|frame| ui::draw(frame, Rect::new(0, 1, 80, 23), Some(&code), "用小宇宙扫码"))
         .unwrap();
     let buffer = terminal.backend().buffer();
     let scale = 8;
@@ -563,7 +943,7 @@ fn tiny_terminal_does_not_panic_or_render_a_partial_qr() {
     for (width, height) in [(0, 0), (1, 1), (20, 10)] {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| ui::draw(frame, Some(&code), "请放大终端窗口", "q 退出"))
+            .draw(|frame| ui::draw(frame, frame.area(), Some(&code), "请放大终端窗口"))
             .unwrap();
         assert!(
             terminal
@@ -756,4 +1136,386 @@ fn device_identity_survives_restarts_and_logout() {
             .unwrap(),
         id
     );
+}
+
+fn subscription_episode(eid: &str) -> serde_json::Value {
+    json!({"eid":eid,"title":format!("标题 {eid}"),"duration":3661,"pubDate":"2026-09-14T17:30:00Z","podcast":{"title":"播客名称"}})
+}
+
+#[tokio::test]
+async fn recommendations_load_full_rankings_in_server_order() {
+    use crate::recommendations::Kind;
+    let server = MockServer::start().await;
+    let api = content::Api::for_test(server.uri()).with_device_id("device".into());
+    for kind in [Kind::Hot, Kind::Trending, Kind::New] {
+        let episodes: Vec<_> = (0..15)
+            .rev()
+            .map(|i| json!({"item":subscription_episode(&i.to_string())}))
+            .collect();
+        Mock::given(path("/v1/top-list/get"))
+            .and(method("GET"))
+            .and(query_param("category", kind.category().unwrap()))
+            .and(header("x-jike-access-token", "test-access"))
+            .and(header("x-jike-device-id", "device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{
+                "category":kind.category(),"targetType":"EPISODE","items":episodes
+            }})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let page = api
+            .recommendations(&credentials(), kind, None)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 15);
+        assert_eq!(page.items[0].eid, "14");
+        assert_eq!(page.items[14].eid, "0");
+        assert_eq!(page.items[0].podcast.as_ref().unwrap().title, "播客名称");
+        assert!(page.cursor.is_none());
+    }
+}
+
+#[tokio::test]
+async fn editor_recommendations_flatten_days_and_pass_opaque_cursors() {
+    use crate::recommendations::Kind;
+    let server = MockServer::start().await;
+    let cursor = json!("2026-09-11T04:00:00.000Z");
+    for next in [false, true] {
+        Mock::given(path("/v1/editor-pick/list-history")).and(method("POST"))
+            .and(body_json(if next {json!({"loadMoreKey":cursor})} else {json!({})}))
+            .respond_with(ResponseTemplate::new(200).set_body_json(if next {
+                json!({"data":[{"picks":[{"episode":subscription_episode("c")}]}]})
+            } else {
+                json!({"data":[{"picks":[{"episode":subscription_episode("b")},{"episode":subscription_episode("b")}]},
+                    {"picks":[{"episode":subscription_episode("a")}]}],"loadMoreKey":cursor})
+            })).expect(1).mount(&server).await;
+    }
+    let api = content::Api::for_test(server.uri());
+    let first = api
+        .recommendations(&credentials(), Kind::Editor, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(|e| e.eid.as_str())
+            .collect::<Vec<_>>(),
+        ["b", "a"]
+    );
+    let last = api
+        .recommendations(&credentials(), Kind::Editor, first.cursor)
+        .await
+        .unwrap();
+    assert_eq!(last.items[0].eid, "c");
+    assert!(last.cursor.is_none());
+}
+
+#[tokio::test]
+async fn personalized_recommendations_skip_non_episode_pages_and_deduplicate_modules() {
+    use crate::recommendations::Kind;
+    let server = MockServer::start().await;
+    let cursor = json!({"section":"collections","opaque":[1,2]});
+    for (body, response) in [
+        (
+            json!({"returnAll":false}),
+            json!({"data":[
+            {"type":"TOP_LIST","data":[]}, {"type":"EDITOR_PICK","data":{"picks":[]}},
+            {"type":"DISCOVERY_COLLECTION","data":[{"targetType":"PODCAST","target":[{"podcast":{"title":"播客合集"}}]}]}
+        ],"loadMoreKey":cursor}),
+        ),
+        (
+            json!({"returnAll":false,"loadMoreKey":cursor}),
+            json!({"data":[
+            {"type":"PRESET_CONTENT","data":{"contents":[{"episode":subscription_episode("a")}] }},
+            {"type":"DISCOVERY_COLLECTION","data":[{"targetType":"EPISODE","target":[{"episode":subscription_episode("a")},{"episode":subscription_episode("b")}]}]},
+            {"type":"DISCOVERY_PICK","data":[{"episode":subscription_episode("c")}]}
+        ],"loadMoreKey":"last"}),
+        ),
+        (
+            json!({"returnAll":false,"loadMoreKey":"last"}),
+            json!({"data":[{"type":"DISCOVERY_HEADER","data":[]}]}),
+        ),
+    ] {
+        Mock::given(path("/v1/discovery-feed/list"))
+            .and(method("POST"))
+            .and(body_json(body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let api = content::Api::for_test(server.uri());
+    let first = api
+        .recommendations(&credentials(), Kind::ForYou, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(|e| e.eid.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b", "c"]
+    );
+    assert_eq!(first.cursor, Some(json!("last")));
+    let last = api
+        .recommendations(&credentials(), Kind::ForYou, first.cursor)
+        .await
+        .unwrap();
+    assert!(last.items.is_empty() && last.cursor.is_none());
+}
+
+#[tokio::test]
+async fn recommendations_reject_bad_shapes_cycles_and_preserve_http_errors() {
+    use crate::recommendations::Kind;
+    let server = MockServer::start().await;
+    let api = content::Api::for_test(server.uri());
+    for (kind, endpoint, data) in [
+        (
+            Kind::Hot,
+            "/v1/top-list/get",
+            json!({"data":{"category":"NEW_STAR_EPISODES","targetType":"EPISODE","items":[]}}),
+        ),
+        (
+            Kind::Editor,
+            "/v1/editor-pick/list-history",
+            json!({"data":[{"picks":[{"episode":{"eid":"a","title":" "}}]}]}),
+        ),
+        (
+            Kind::ForYou,
+            "/v1/discovery-feed/list",
+            json!({"data":[{"type":"PRESET_CONTENT","data":{}}]}),
+        ),
+    ] {
+        let mock = Mock::given(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_json(data))
+            .mount_as_scoped(&server)
+            .await;
+        assert!(matches!(
+            api.recommendations(&credentials(), kind, None).await,
+            Err(Error::InvalidResponse)
+        ));
+        drop(mock);
+        for status in [401, 429, 503] {
+            let mock = Mock::given(path(endpoint))
+                .respond_with(ResponseTemplate::new(status).insert_header("Retry-After", "10"))
+                .mount_as_scoped(&server)
+                .await;
+            let error = api
+                .recommendations(&credentials(), kind, None)
+                .await
+                .err()
+                .unwrap();
+            if status == 429 {
+                assert!(
+                    matches!(error, Error::RateLimited(delay) if delay == Duration::from_secs(10))
+                );
+            } else {
+                assert!(matches!(error, Error::Http(code) if code.as_u16() == status));
+            }
+            drop(mock);
+        }
+    }
+    for (cursor, next) in [("a", "b"), ("b", "a")] {
+        Mock::given(path("/v1/discovery-feed/list"))
+            .and(body_json(json!({"returnAll":false,"loadMoreKey":cursor})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":[{"type":"UNKNOWN"}],"loadMoreKey":next})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    assert!(matches!(
+        api.recommendations(&credentials(), Kind::ForYou, Some(json!("a")))
+            .await,
+        Err(Error::InvalidResponse)
+    ));
+}
+
+#[tokio::test]
+async fn subscriptions_pass_device_and_opaque_cursor_and_keep_metadata() {
+    let server = MockServer::start().await;
+    let cursor = json!({"id":"cursor-id","pubDate":"2026-09-14T17:30:00Z","nested":[1,"2"]});
+    Mock::given(path("/v2/inbox/list")).and(method("POST"))
+        .and(header("x-jike-access-token", "test-access"))
+        .and(header("x-jike-device-id", "device"))
+        .and(body_json(json!({"limit":20})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[subscription_episode("a"),subscription_episode("a")],"loadMoreKey":cursor})))
+        .expect(1).mount(&server).await;
+    Mock::given(path("/v2/inbox/list"))
+        .and(body_json(json!({"limit":20,"loadMoreKey":cursor})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data":[subscription_episode("b")]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = content::Api::for_test(server.uri()).with_device_id("device".into());
+    let first = api.subscriptions(&credentials(), None).await.unwrap();
+    assert_eq!(first.items.len(), 1);
+    let episode = &first.items[0];
+    assert_eq!(episode.duration, Some(3661));
+    assert_eq!(episode.pub_date.as_deref(), Some("2026-09-14T17:30:00Z"));
+    assert_eq!(episode.podcast.as_ref().unwrap().title, "播客名称");
+    let last = api
+        .subscriptions(&credentials(), first.cursor)
+        .await
+        .unwrap();
+    assert_eq!(last.items[0].eid, "b");
+    assert!(last.cursor.is_none());
+    for request in server.received_requests().await.unwrap() {
+        assert!(!request.headers.contains_key("x-jike-refresh-token"));
+    }
+}
+
+#[tokio::test]
+async fn subscriptions_reject_bad_pages_and_preserve_http_errors() {
+    let server = MockServer::start().await;
+    let api = content::Api::for_test(server.uri());
+    for body in [
+        json!({}),
+        json!({"data":[],"loadMoreKey":{"id":"next"}}),
+        json!({"data":[{"eid":"a","title":" "}]}),
+        json!({"data":[subscription_episode("a")],"loadMoreKey":{"id":"same"}}),
+    ] {
+        let mock = Mock::given(path("/v2/inbox/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount_as_scoped(&server)
+            .await;
+        assert!(matches!(
+            api.subscriptions(&credentials(), Some(json!({"id":"same"})))
+                .await,
+            Err(Error::InvalidResponse)
+        ));
+        drop(mock);
+    }
+    for status in [401, 429, 503] {
+        let mock = Mock::given(path("/v2/inbox/list"))
+            .respond_with(ResponseTemplate::new(status).insert_header("Retry-After", "10"))
+            .mount_as_scoped(&server)
+            .await;
+        let error = api.subscriptions(&credentials(), None).await.err().unwrap();
+        if status == 429 {
+            assert!(matches!(error, Error::RateLimited(delay) if delay == Duration::from_secs(10)));
+        } else {
+            assert!(matches!(error, Error::Http(code) if code.as_u16() == status));
+        }
+        drop(mock);
+    }
+}
+
+#[tokio::test]
+async fn details_and_read_only_comments_preserve_body_and_paginate() {
+    let server = MockServer::start().await;
+    let mut episode = subscription_episode("a");
+    episode["shownotes"] = json!("<h2>简介</h2><p>内容 &amp; <b>重点</b></p>");
+    episode["description"] = json!("简短介绍");
+    Mock::given(path("/v1/episode/get"))
+        .and(method("GET"))
+        .and(query_param("eid", "a"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":episode})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cursor = json!({"id":"c","direction":"NEXT","hotSortScore":10.5,"section":"HOT"});
+    for next in [false, true] {
+        let mut body = json!({"owner":{"id":"a","type":"EPISODE"},"order":"HOT","limit":20});
+        if next {
+            body["loadMoreKey"] = cursor.clone();
+        }
+        let comment = json!({"id":if next {"d"} else {"c"},"text":"第一行\n第二行\u{001b}","author":{"nickname":"用户\n名字"},"createdAt":"2026-09-15T01:00:00Z","likeCount":2});
+        Mock::given(path("/v1/comment/list-primary")).and(method("POST")).and(body_json(body))
+            .and(header_exists("x-jike-device-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[comment],"loadMoreKey":if next {serde_json::Value::Null} else {cursor.clone()}})))
+            .expect(1).mount(&server).await;
+    }
+    let api = content::Api::for_test(server.uri());
+    let detail = api.episode_detail(&credentials(), "a").await.unwrap();
+    assert!(detail.shownotes.unwrap().contains("<h2>"));
+    let first = api.comments(&credentials(), "a", None).await.unwrap();
+    assert_eq!(
+        first.items[0].author.as_ref().unwrap().nickname,
+        "用户 名字"
+    );
+    assert_eq!(first.items[0].text, "第一行\n第二行");
+    let last = api
+        .comments(&credentials(), "a", first.cursor)
+        .await
+        .unwrap();
+    assert_eq!(last.items[0].id, "d");
+    assert!(last.cursor.is_none());
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn addition_appends_rebases_and_is_idempotent() {
+    use std::sync::{Arc, Mutex};
+    let server = MockServer::start().await;
+    let state = Arc::new(Mutex::new((vec!["a"], 0)));
+    let shared = state.clone();
+    Mock::given(path("/v1/playlist/pull"))
+        .respond_with(move |_: &wiremock::Request| {
+            let state = shared.lock().unwrap();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data":{"list":state.0,"sha":format!("r{}",state.1)}}))
+        })
+        .mount(&server)
+        .await;
+    let shared = state.clone();
+    Mock::given(path("/v1/playlist/patch"))
+        .and(header_exists("x-jike-device-id"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            let mut state = shared.lock().unwrap();
+            assert_eq!(body["base"], format!("r{}", state.1));
+            assert_eq!(
+                body["ops"],
+                json!([{"action":"add","item":"b","pos":state.0.len()}])
+            );
+            if state.1 == 0 {
+                state.0.push("concurrent");
+                state.1 += 1;
+                ResponseTemplate::new(409)
+            } else {
+                state.0.push("b");
+                state.1 += 1;
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":{"kind":"ACK","id":body["id"],"sha":"r2"}}))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let api = content::Api::for_test(server.uri());
+    api.add_to_playlist(&credentials(), "b").await.unwrap();
+    api.add_to_playlist(&credentials(), "b").await.unwrap();
+    assert_eq!(state.lock().unwrap().0, ["a", "concurrent", "b"]);
+}
+
+#[tokio::test]
+async fn addition_does_not_claim_success_without_server_confirmation() {
+    let server = MockServer::start().await;
+    Mock::given(path("/v1/playlist/pull"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data":{"list":["a"],"sha":"r1"}})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(path("/v1/playlist/patch"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data":{"kind":"ACK","id":body["id"],"sha":"r2"}}))
+        })
+        .mount(&server)
+        .await;
+    assert!(matches!(
+        content::Api::for_test(server.uri())
+            .add_to_playlist(&credentials(), "b")
+            .await,
+        Err(Error::PlaylistChanged)
+    ));
 }

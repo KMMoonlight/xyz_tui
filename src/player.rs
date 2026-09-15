@@ -9,7 +9,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::content::{Playable, ProgressUpdate};
+use crate::content::{Playable, ProgressUpdate, RecentEpisode};
 
 pub enum Event {
     Position(u64, f64),
@@ -17,6 +17,12 @@ pub enum Event {
     Loaded(u64, Option<f64>),
     Ended(u64, bool),
     Failed(u64, String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Control {
+    TogglePause,
+    Seek(i64),
 }
 
 pub struct Playing {
@@ -36,7 +42,7 @@ pub struct Player {
     pub current: Option<Playing>,
     pub error: Option<String>,
     serial: u64,
-    commands: Option<mpsc::UnboundedSender<()>>,
+    commands: Option<mpsc::UnboundedSender<Control>>,
     task: Option<JoinHandle<()>>,
 }
 
@@ -47,6 +53,26 @@ impl Drop for Player {
 }
 
 impl Player {
+    pub fn restore(&mut self, recent: RecentEpisode) {
+        self.stop();
+        self.error = None;
+        self.current = Some(Playing {
+            eid: recent.episode.eid,
+            pid: recent.pid,
+            title: recent.episode.title,
+            duration: recent.episode.duration.map(|duration| duration as f64),
+            position: recent.progress,
+            paused: true,
+            loading: false,
+            ended: false,
+            confirmed_position: false,
+        });
+    }
+
+    pub fn awaiting_resume(&self) -> bool {
+        self.current.is_some() && self.commands.is_none()
+    }
+
     pub fn play(&mut self, source: Playable, emit: Arc<dyn Fn(Event) + Send + Sync>) {
         self.stop();
         self.serial += 1;
@@ -74,7 +100,18 @@ impl Player {
 
     pub fn toggle(&self) {
         if let Some(commands) = &self.commands {
-            let _ = commands.send(());
+            let _ = commands.send(Control::TogglePause);
+        }
+    }
+
+    pub fn seek(&self, seconds: i64) {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|current| !current.loading && !current.ended)
+            && let Some(commands) = &self.commands
+        {
+            let _ = commands.send(Control::Seek(seconds));
         }
     }
 
@@ -126,7 +163,7 @@ impl Player {
                 current.ended = true;
                 current.paused = true;
                 if failed {
-                    self.error = Some("音频播放失败，Enter 重试".into());
+                    self.error = Some("音频播放失败".into());
                 } else if current.confirmed_position
                     && let Some(duration) = current.duration
                 {
@@ -156,7 +193,7 @@ impl Player {
 async fn run(
     source: Playable,
     serial: u64,
-    mut commands: mpsc::UnboundedReceiver<()>,
+    mut commands: mpsc::UnboundedReceiver<Control>,
     emit: Arc<dyn Fn(Event) + Send + Sync>,
     audio_output: Option<&str>,
 ) -> Result<(), String> {
@@ -228,9 +265,12 @@ async fn run(
     loop {
         tokio::select! {
             command = commands.recv() => match command {
-                Some(()) => {
+                Some(Control::TogglePause) => {
                     desired_pause = !desired_pause;
                     send(&mut writer, json!(["set_property", "pause", desired_pause])).await?;
+                }
+                Some(Control::Seek(seconds)) => {
+                    send(&mut writer, json!(["seek", seconds, "relative+exact"])).await?;
                 }
                 None => break,
             },
@@ -247,7 +287,8 @@ async fn run(
                         Some("time-pos") => {
                             if let Some(value) = value.get("data").and_then(Value::as_f64) {
                                 if !loaded { loaded = true; emit(Event::Loaded(serial, duration)); }
-                                position = Some(value);
+                                // mpv's audio clock can briefly be negative after seeking to the start.
+                                position = Some(value.max(0.0));
                             }
                         }
                         Some("duration") => {
@@ -273,17 +314,16 @@ async fn run(
                 }
             },
             _ = interval.tick() => {
-                if let Some(position) = position {
-                    let second = position as u64;
-                    if last_sent != Some(second) {
-                        emit(Event::Position(serial, position));
-                        last_sent = Some(second);
-                    }
+                if let Some(position) = position
+                    && last_sent != Some(position)
+                {
+                    emit(Event::Position(serial, position));
+                    last_sent = Some(position);
                 }
             }
         }
     }
-    Err("播放器已断开，Enter 重试".into())
+    Err("播放器已断开".into())
 }
 
 async fn send(writer: &mut tokio::net::unix::OwnedWriteHalf, command: Value) -> Result<(), String> {
@@ -296,7 +336,7 @@ async fn send(writer: &mut tokio::net::unix::OwnedWriteHalf, command: Value) -> 
 
 #[cfg(test)]
 impl Player {
-    pub fn simulated() -> (Self, mpsc::UnboundedReceiver<()>) {
+    pub fn simulated() -> (Self, mpsc::UnboundedReceiver<Control>) {
         let (sender, receiver) = mpsc::unbounded_channel();
         (
             Self {
@@ -350,7 +390,7 @@ mod tests {
     async fn mpv_decodes_seeks_pauses_resumes_and_finishes() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("silence.wav");
-        let samples = 6 * 8000;
+        let samples = 36 * 8000;
         let mut wav = Vec::new();
         wav.extend_from_slice(b"RIFF");
         wav.extend_from_slice(&(36_u32 + samples * 2).to_le_bytes());
@@ -371,8 +411,9 @@ mod tests {
             pid: "podcast".into(),
             title: "silent fixture".into(),
             url: path.to_str().unwrap().into(),
-            duration: Some(6),
-            start: 1.0,
+            duration: Some(36),
+            start: 16.0,
+            transcript_media_id: None,
         };
         let (commands, receiver) = mpsc::unbounded_channel();
         let (sender, mut events) = mpsc::unbounded_channel();
@@ -387,12 +428,14 @@ mod tests {
             }),
             Some("null"),
         ));
-        tokio::time::timeout(Duration::from_secs(12), async {
+        let mut phase = "load";
+        let outcome = tokio::time::timeout(Duration::from_secs(12), async {
             while player.progress().is_none() {
                 player.apply(events.recv().await.unwrap());
             }
-            assert!(player.current.as_ref().unwrap().position >= 0.9);
-            commands.send(()).unwrap();
+            assert!(player.current.as_ref().unwrap().position >= 15.9);
+            phase = "pause";
+            commands.send(Control::TogglePause).unwrap();
             while !player.current.as_ref().unwrap().paused {
                 player.apply(events.recv().await.unwrap());
             }
@@ -402,18 +445,52 @@ mod tests {
                 player.apply(event);
             }
             assert!((player.current.as_ref().unwrap().position - paused).abs() < 0.15);
-            commands.send(()).unwrap();
+            for seconds in [-15, -15, 15, 15] {
+                let target = (player.current.as_ref().unwrap().position + seconds as f64).max(0.0);
+                phase = if seconds < 0 {
+                    "seek backward"
+                } else {
+                    "seek forward"
+                };
+                commands.send(Control::Seek(seconds)).unwrap();
+                // Allow for the audio output buffer and the 250 ms position sampling interval.
+                while (player.current.as_ref().unwrap().position - target).abs() >= 0.5 {
+                    player.apply(events.recv().await.unwrap());
+                    assert!(player.current.as_ref().unwrap().paused);
+                    assert!(!player.current.as_ref().unwrap().ended);
+                }
+                // mpv's sample timestamps can fall just below a whole-second boundary.
+                assert!(
+                    player
+                        .progress()
+                        .unwrap()
+                        .progress
+                        .abs_diff(target.floor() as u64)
+                        <= 1
+                );
+            }
+            phase = "resume";
+            commands.send(Control::TogglePause).unwrap();
             while player.current.as_ref().unwrap().paused {
                 player.apply(events.recv().await.unwrap());
             }
+            phase = "finish";
             while !player.current.as_ref().unwrap().ended {
                 player.apply(events.recv().await.unwrap());
             }
             assert!(player.error.is_none());
-            assert_eq!(player.progress().unwrap().progress, 6);
+            assert_eq!(player.progress().unwrap().progress, 36);
         })
-        .await
-        .unwrap();
+        .await;
+        let current = player.current.as_ref().unwrap();
+        assert!(
+            outcome.is_ok(),
+            "timed out during {phase}: position={}, paused={}, ended={}, error={:?}",
+            current.position,
+            current.paused,
+            current.ended,
+            player.error
+        );
         task.await.unwrap().unwrap();
     }
 }

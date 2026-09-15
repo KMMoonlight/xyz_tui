@@ -31,6 +31,15 @@ impl Playlist {
             .map(|entry| entry.eid.clone())
     }
 
+    pub fn next_after(&self, eid: &str) -> Option<String> {
+        let next = self
+            .entries
+            .iter()
+            .position(|entry| entry.eid == eid)
+            .map_or(0, |index| index + 1);
+        self.entries.get(next).map(|entry| entry.eid.clone())
+    }
+
     pub fn set_progress(&mut self, eid: &str, seconds: f64) {
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.eid == eid) {
             entry.progress = Some(seconds);
@@ -131,12 +140,22 @@ impl Playlist {
                 .style(Style::default().add_modifier(Modifier::BOLD)),
             Rect::new(area.x, area.y, area.width, 1),
         );
+        let status = if let Some(error) = &self.error {
+            error.to_string()
+        } else if self.loading && !self.entries.is_empty() {
+            "刷新中…".into()
+        } else {
+            String::new()
+        };
+        let status_height = u16::from(!status.is_empty());
         let list_top = area.y + if area.height >= 10 { 2 } else { 1 };
         let list_area = Rect::new(
             area.x,
             list_top,
             area.width,
-            (area.bottom() - 2).saturating_sub(list_top),
+            area.bottom()
+                .saturating_sub(status_height)
+                .saturating_sub(list_top),
         );
         if self.entries.is_empty() {
             let message = if self.loading {
@@ -184,38 +203,14 @@ impl Playlist {
                 &mut self.state,
             );
         }
-        let status = if let Some(error) = &self.error {
-            error.to_string()
-        } else if self.loading && !self.entries.is_empty() {
-            "刷新中…".into()
-        } else {
-            String::new()
-        };
         frame.render_widget(
             Paragraph::new(status).centered().style(muted),
-            Rect::new(area.x, area.bottom() - 2, area.width, 1),
-        );
-        let hint = if self.needs_login() {
-            "Enter 登录 · Esc 返回"
-        } else if self.loading {
-            "Esc 返回"
-        } else if self.error.is_some()
-            || self
-                .entries
-                .iter()
-                .any(|entry| entry.episode.is_err() || entry.progress_failed)
-        {
-            "r 重试 · Esc 返回"
-        } else {
-            if area.width >= 52 {
-                "Enter 播放 · x 移除 · r 刷新 · Esc 返回"
-            } else {
-                "Enter 播放 · x 移除 · Esc 返回"
-            }
-        };
-        frame.render_widget(
-            Paragraph::new(hint).centered().style(muted),
-            Rect::new(area.x, area.bottom() - 1, area.width, 1),
+            Rect::new(
+                area.x,
+                area.bottom().saturating_sub(status_height),
+                area.width,
+                status_height,
+            ),
         );
     }
 }
@@ -293,8 +288,23 @@ mod tests {
                 title: format!("单集 {eid}"),
                 duration: Some(65),
                 podcast: None,
+                ..Default::default()
             }),
         }
+    }
+
+    #[test]
+    fn next_episode_follows_queue_order_independently_of_selection() {
+        let mut list = Playlist::default();
+        assert_eq!(list.next_after("a"), None);
+        list.apply(Ok(vec![entry("a"), entry("b"), entry("c")]));
+        list.key(KeyCode::End);
+        assert_eq!(list.next_after("a").as_deref(), Some("b"));
+        assert_eq!(list.next_after("b").as_deref(), Some("c"));
+        assert_eq!(list.next_after("c"), None);
+        list.remove("a");
+        assert_eq!(list.next_after("a").as_deref(), Some("b"));
+        assert_eq!(list.selected_id().as_deref(), Some("c"));
     }
 
     #[test]

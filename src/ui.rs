@@ -4,8 +4,33 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Style},
+    text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
+
+pub fn playback_progress(position: f64, duration: Option<f64>, width: u16) -> Line<'static> {
+    let duration = duration.filter(|seconds| seconds.is_finite() && *seconds > 0.0);
+    let time = format!(
+        "{} / {}",
+        crate::playlist::format_duration(position as u64),
+        duration
+            .map(|seconds| crate::playlist::format_duration(seconds as u64))
+            .unwrap_or_else(|| "--:--".into()),
+    );
+    let bar_width = usize::from(width).saturating_sub(time.len() + 3);
+    if bar_width < 4 {
+        return Line::raw(time);
+    }
+    let filled = duration.map_or(0, |duration| {
+        ((position / duration).clamp(0.0, 1.0) * bar_width as f64) as usize
+    });
+    Line::from(vec![
+        Span::raw("["),
+        Span::styled("#".repeat(filled), Style::default().fg(Color::Cyan)),
+        Span::raw("-".repeat(bar_width - filled)),
+        Span::raw(format!("] {time}")),
+    ])
+}
 
 pub struct Code {
     qr: QrCode,
@@ -55,12 +80,11 @@ impl Widget for &Code {
     }
 }
 
-pub fn draw(frame: &mut Frame, code: Option<&Code>, message: &str, hint: &str) {
-    let area = frame.area();
+pub fn draw(frame: &mut Frame, area: Rect, code: Option<&Code>, message: &str) {
     let code =
-        code.filter(|code| area.width >= code.width() + 2 && area.height >= code.height() + 3);
+        code.filter(|code| area.width >= code.width() + 2 && area.height >= code.height() + 2);
     let height = code.map_or(1, |code| code.height() + 2);
-    let top = area.y + area.height.saturating_sub(height + 1) / 2;
+    let top = area.y + area.height.saturating_sub(height) / 2;
     let message_y = if let Some(code) = code {
         frame.render_widget(
             code,
@@ -78,11 +102,5 @@ pub fn draw(frame: &mut Frame, code: Option<&Code>, message: &str, hint: &str) {
     frame.render_widget(
         Paragraph::new(message).centered(),
         Rect::new(area.x, message_y, area.width, 1).intersection(area),
-    );
-    frame.render_widget(
-        Paragraph::new(hint)
-            .centered()
-            .style(Style::default().fg(Color::DarkGray)),
-        Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1).intersection(area),
     );
 }

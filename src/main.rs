@@ -2,10 +2,16 @@ mod account;
 mod app;
 mod auth;
 mod content;
+mod help;
 mod home;
+mod markdown;
 mod player;
 mod playlist;
+mod recommendations;
 mod session;
+mod settings;
+mod subscriptions;
+mod transcript;
 mod ui;
 
 #[cfg(test)]

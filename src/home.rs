@@ -3,11 +3,14 @@ use ratatui::{
     Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
-    text::Span,
+    text::{Line, Text},
     widgets::Paragraph,
 };
 
-use crate::{auth::Error, content::PlaylistEntry, playlist::Playlist};
+use crate::recommendations::Recommendations;
+use crate::settings::Settings;
+use crate::subscriptions::{self, Source, Subscriptions};
+use crate::{auth::Error, content::PlaylistEntry, help::Context, playlist::Playlist};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Menu {
@@ -42,7 +45,10 @@ pub enum Action {
     LoadPlaylist,
     Login,
     Play(String),
+    PlayAndAdd(String),
     Remove(String),
+    Add(String),
+    Browse(Source, Vec<subscriptions::Request>),
 }
 
 #[derive(Default)]
@@ -56,20 +62,57 @@ enum Screen {
 pub struct Home {
     selected: Menu,
     screen: Screen,
-    logout_failed: bool,
     playlist: Playlist,
+    subscriptions: Box<Subscriptions>,
+    recommendations: Box<Recommendations>,
+    settings: Box<Settings>,
 }
 
 impl Home {
+    pub fn help_context(&self) -> Context {
+        match self.screen {
+            Screen::Menu => Context::Menu,
+            Screen::Detail(Menu::Playlist) => Context::Playlist {
+                needs_login: self.playlist.needs_login(),
+            },
+            Screen::Detail(Menu::Subscriptions) => self.subscriptions.help_context(),
+            Screen::Detail(Menu::Settings) => self.settings.help_context(),
+            Screen::Detail(Menu::Recommendations) => self.recommendations.help_context(),
+        }
+    }
+
     pub fn key(&mut self, key: KeyCode) -> Action {
         if let Screen::Detail(menu) = self.screen {
+            if matches!(
+                menu,
+                Menu::Subscriptions | Menu::Recommendations | Menu::Settings
+            ) {
+                let (source, action) = if menu == Menu::Recommendations {
+                    let (kind, action) = self.recommendations.key(key);
+                    (Source::Recommendation(kind), action)
+                } else if menu == Menu::Settings {
+                    (Source::History, self.settings.key(key))
+                } else {
+                    (Source::Subscriptions, self.subscriptions.key(key))
+                };
+                return match action {
+                    subscriptions::Action::None => Action::None,
+                    subscriptions::Action::Back => {
+                        self.screen = Screen::Menu;
+                        Action::None
+                    }
+                    subscriptions::Action::Login => Action::Login,
+                    subscriptions::Action::Logout => Action::Logout,
+                    subscriptions::Action::Play(eid) => Action::PlayAndAdd(eid),
+                    subscriptions::Action::Add(eid) => Action::Add(eid),
+                    subscriptions::Action::Load(requests) => Action::Browse(source, requests),
+                };
+            }
             return match key {
                 KeyCode::Esc | KeyCode::Backspace => {
                     self.screen = Screen::Menu;
-                    self.logout_failed = false;
                     Action::None
                 }
-                KeyCode::Enter if menu == Menu::Settings => Action::Logout,
                 KeyCode::Enter if menu == Menu::Playlist && self.playlist.needs_login() => {
                     Action::Login
                 }
@@ -111,19 +154,28 @@ impl Home {
                 if self.selected == Menu::Playlist && !self.playlist.requested() {
                     return Action::LoadPlaylist;
                 }
+                if self.selected == Menu::Subscriptions {
+                    return Action::Browse(Source::Subscriptions, self.subscriptions.enter());
+                }
+                if self.selected == Menu::Recommendations {
+                    let (kind, requests) = self.recommendations.enter();
+                    return Action::Browse(Source::Recommendation(kind), requests);
+                }
+                if self.selected == Menu::Settings {
+                    return Action::Browse(Source::History, self.settings.enter());
+                }
                 None
             }
             _ => None,
         };
         if let Some(index) = next {
             self.selected = Menu::ALL[index];
-            self.logout_failed = false;
         }
         Action::None
     }
 
     pub fn logout_failed(&mut self) {
-        self.logout_failed = true;
+        self.settings.logout_failed();
     }
 
     pub fn loading_playlist(&mut self) {
@@ -134,12 +186,24 @@ impl Home {
         self.playlist.apply(result);
     }
 
+    pub fn apply_browse(&mut self, source: Source, response: subscriptions::Response) {
+        match source {
+            Source::Recommendation(kind) => self.recommendations.apply(kind, response),
+            Source::Subscriptions => self.subscriptions.apply(response),
+            Source::History => self.settings.apply(response),
+        }
+    }
+
     pub fn progress(&mut self, eid: &str, seconds: f64) {
         self.playlist.set_progress(eid, seconds);
     }
 
     pub fn remove(&mut self, eid: &str) {
         self.playlist.remove(eid);
+    }
+
+    pub fn next_after(&self, eid: &str) -> Option<String> {
+        self.playlist.next_after(eid)
     }
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
@@ -149,7 +213,6 @@ impl Home {
         }
         match self.screen {
             Screen::Menu => self.draw_menu(frame, area),
-            Screen::Detail(Menu::Settings) => self.draw_settings(frame, area),
             Screen::Detail(Menu::Playlist) => {
                 let content = centered(
                     area,
@@ -158,22 +221,28 @@ impl Home {
                 );
                 self.playlist.draw(frame, content);
             }
-            Screen::Detail(menu) => {
-                let content = centered(area, 72, area.height.saturating_sub(2).min(20));
-                text(
-                    frame,
-                    row(content, 0),
-                    menu.label(),
-                    Style::default().add_modifier(Modifier::BOLD),
+            Screen::Detail(
+                menu @ (Menu::Subscriptions | Menu::Recommendations | Menu::Settings),
+            ) => {
+                let content = centered(
+                    area,
+                    112.min(area.width.saturating_sub(2)),
+                    area.height.saturating_sub(2),
                 );
-                text(frame, row(content, content.height - 1), "Esc 返回", muted());
+                if menu == Menu::Recommendations {
+                    self.recommendations.draw(frame, content);
+                } else if menu == Menu::Settings {
+                    self.settings.draw(frame, content);
+                } else {
+                    self.subscriptions.draw(frame, content);
+                }
             }
         }
     }
 
     fn draw_menu(&self, frame: &mut Frame, area: Rect) {
-        let menu_area = centered(area, 28, 6);
-        for (index, menu) in Menu::ALL.into_iter().enumerate() {
+        let mut lines = Vec::with_capacity(Menu::ALL.len());
+        for menu in Menu::ALL {
             let style = if menu == self.selected {
                 Style::default()
                     .fg(Color::Cyan)
@@ -181,28 +250,11 @@ impl Home {
             } else {
                 Style::default()
             };
-            text(frame, row(menu_area, index as u16), menu.label(), style);
+            lines.push(Line::styled(menu.label(), style));
         }
-        text(frame, row(menu_area, 5), "Enter 进入 · q 退出", muted());
-    }
-
-    fn draw_settings(&self, frame: &mut Frame, area: Rect) {
-        let content = centered(area, 28, 5);
-        text(frame, row(content, 0), "设置", muted());
-        text(
-            frame,
-            row(content, 2),
-            "退出登录",
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::UNDERLINED),
-        );
-        let hint = if self.logout_failed {
-            "退出失败 · Enter 重试"
-        } else {
-            "Enter 确认 · Esc 返回"
-        };
-        text(frame, row(content, 4), hint, muted());
+        let content = Text::from(lines);
+        let menu_area = centered(area, content.width() as u16, content.height() as u16);
+        frame.render_widget(Paragraph::new(content), menu_area);
     }
 }
 
@@ -215,16 +267,4 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     )
-}
-
-fn row(area: Rect, offset: u16) -> Rect {
-    Rect::new(area.x, area.y + offset, area.width, 1)
-}
-
-fn muted() -> Style {
-    Style::default().fg(Color::DarkGray)
-}
-
-fn text(frame: &mut Frame, area: Rect, label: &str, style: Style) {
-    frame.render_widget(Paragraph::new(Span::styled(label, style)).centered(), area);
 }
