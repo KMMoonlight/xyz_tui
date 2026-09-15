@@ -1,0 +1,76 @@
+{
+  "observed_at": "2026-09-14T14:31:21.513714+00:00",
+  "method": "GET",
+  "client": "curl default User-Agent; no cookies, no access/refresh token; one media request used Range",
+  "limitations": [
+    "Two public podcast pages and one episode page; no authenticated API tested.",
+    "Media transport checked using 1024 bytes; no decoder, audible playback or seeking test.",
+    "401 without credentials and app headers does not validate the correct authenticated header set.",
+    "Episode lists in SSR are initial pages; no complete-history claim."
+  ],
+  "results": [
+    {
+      "url": "https://www.xiaoyuzhoufm.com/podcast/6013f9f58e2f7ee375cf4216",
+      "status": 200,
+      "content-type": "text/html; charset=utf-8",
+      "content-length": "506714",
+      "data_path": "props.pageProps.podcast",
+      "declared_episode_count": 270,
+      "returned_episode_count": 15,
+      "sync_mode": "SELF_HOSTING",
+      "rss_or_feed_fields": []
+    },
+    {
+      "url": "https://www.xiaoyuzhoufm.com/podcast/6154145ff1ab4fd904a8e964",
+      "status": 200,
+      "content-type": "text/html; charset=utf-8",
+      "data_path": "props.pageProps.podcast",
+      "declared_episode_count": 18,
+      "returned_episode_count": 15,
+      "sync_mode": "RSS",
+      "rss_or_feed_fields": []
+    },
+    {
+      "url": "https://www.xiaoyuzhoufm.com/episode/6aa37bcd492687f6aad83995",
+      "status": 200,
+      "content-type": "text/html; charset=utf-8",
+      "content-length": "304738",
+      "embedded_status_code": 200,
+      "data_path": "props.pageProps.episode",
+      "duration_seconds": 6569,
+      "has_shownotes": true,
+      "is_private_media": false,
+      "media_mode": "PUBLIC",
+      "media_mime_type": "audio/mp4",
+      "media_url": "https://media.xyzcdn.net/6013f9f58e2f7ee375cf4216/loGxCTJKAL3ai1ENFwXDD8J9Fpv2.m4a",
+      "initial_comment_count": 21,
+      "transcript_fields": [
+        "mediaId"
+      ]
+    },
+    {
+      "url": "https://media.xyzcdn.net/6013f9f58e2f7ee375cf4216/loGxCTJKAL3ai1ENFwXDD8J9Fpv2.m4a",
+      "request_range": "bytes=0-1023",
+      "status": 206,
+      "content-type": "audio/mp4",
+      "content-length": "1024",
+      "content-range": "bytes 0-1023/106348142",
+      "accept-ranges": "bytes",
+      "bytes_read": 1024
+    },
+    {
+      "url": "https://api.xiaoyuzhoufm.com/v1/episode/get?eid=6aa37bcd492687f6aad83995",
+      "status": 401,
+      "content-type": "text/html",
+      "content-length": "176",
+      "credentials": false
+    },
+    {
+      "url": "https://api.xiaoyuzhoufm.com/v1/podcast/get?pid=6013f9f58e2f7ee375cf4216",
+      "status": 401,
+      "content-type": "text/html",
+      "content-length": "176",
+      "credentials": false
+    }
+  ]
+}
